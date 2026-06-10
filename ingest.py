@@ -35,8 +35,8 @@ IMAGES_DIR      = "data/images"
 FAISS_INDEX_DIR = "faiss_index"
 EMBED_MODEL     = "BAAI/bge-small-en-v1.5"
 
-CHUNK_SIZE      = 1000
-CHUNK_OVERLAP   = 200
+CHUNK_SIZE      = 2000
+CHUNK_OVERLAP   = 400
 
 MIN_IMAGE_WIDTH  = 100
 MIN_IMAGE_HEIGHT = 100
@@ -77,23 +77,86 @@ def initialize_models():
 # ─────────────────────────────────────────────────────────
 #  IMAGE CAPTIONING HELPER
 # ─────────────────────────────────────────────────────────
-def generate_image_caption(image: Image.Image, source_hint: str = "") -> str:
+def generate_image_caption(image, source_hint=""):
     """
-    Generate a rich text description using BLIP + OCR.
-    Returns merged caption + OCR string.
+    Generate image description using Groq Vision (Llama-3.2-11b-vision).
+    Falls back to local BLIP + OCR if Groq key is not found or fails.
+ 
+    KEY FIX: Groq Vision prompt now explicitly asks for the figure title/name
+    FIRST in the response so the embedding is anchored to the diagram name,
+    not a generic description.
+ 
+    Returns (caption, ocr_text).
     """
     global _blip_processor, _blip_model, _blip_available
-
-    caption = ""
-
+ 
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if groq_api_key:
+        try:
+            from groq import Groq
+            from io import BytesIO
+ 
+            buffered = BytesIO()
+            image.save(buffered, format="PNG")
+            img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+ 
+            client = Groq(api_key=groq_api_key)
+            response = client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Look at this diagram carefully and respond in EXACTLY this format:\n\n"
+                                    "Figure title: <exact title visible in or near the diagram, or 'Unknown' if none>\n"
+                                    "Components:\n"
+                                    "- <every box, node, and operation label exactly as written>\n"
+                                    "Data flow: <step by step how data moves through the diagram following arrows>\n"
+                                    "All text visible: <every word, symbol, variable name visible in the diagram>\n\n"
+                                    "Example:\n"
+                                    "Figure title: Scaled Dot-Product Attention\n"
+                                    "Components:\n"
+                                    "- MatMul\n"
+                                    "- Scale\n"
+                                    "- SoftMax\n"
+                                    "- Mask (opt.)\n"
+                                    "- Q, K, V\n"
+                                    "Data flow: Q and K → MatMul → Scale (/√dk) → Mask (opt.) → SoftMax → MatMul with V → Output\n"
+                                    "All text visible: MatMul, Scale, SoftMax, Mask, opt., Q, K, V, dk\n\n"
+                                    "Do not write anything outside this format. No preamble, no explanation."
+                                )
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                            }
+                        ]
+                    }
+                ],
+                model="llama-3.2-11b-vision-preview",
+                max_tokens=400   # increased from 300 for richer captions
+            )
+            caption = response.choices[0].message.content.strip()
+            if source_hint:
+                caption += f"\nSource: {source_hint}"
+            return caption, ""
+        except Exception as e:
+            print(f"    Groq Vision failed, falling back to BLIP+OCR: {e}")
+ 
+    # ── Fallback: local BLIP + OCR (unchanged) ──
+    caption  = ""
+    ocr_text = ""
+ 
     if _blip_available is None:
         initialize_models()
-
+ 
     if _blip_available:
         try:
             import torch
             _device = next(_blip_model.parameters()).device
-            inputs = _blip_processor(image, return_tensors="pt").to(_device)
+            inputs  = _blip_processor(image, return_tensors="pt").to(_device)
             with torch.no_grad():
                 out = _blip_model.generate(**inputs, max_new_tokens=60)
             caption = _blip_processor.decode(out[0], skip_special_tokens=True).strip()
@@ -102,8 +165,7 @@ def generate_image_caption(image: Image.Image, source_hint: str = "") -> str:
             caption = "visual content: diagram or figure"
     else:
         caption = "visual content: diagram or figure"
-
-    # OCR — append any embedded text
+ 
     try:
         import pytesseract
         tesseract_cmd = os.getenv("TESSERACT_CMD")
@@ -113,17 +175,60 @@ def generate_image_caption(image: Image.Image, source_hint: str = "") -> str:
             pytesseract.pytesseract.tesseract_cmd = (
                 r"C:\Program Files\Tesseract-OCR\tesseract.exe"
             )
-        ocr_text = pytesseract.image_to_string(image).strip()
-        if ocr_text and len(ocr_text) > 10:
-            caption += f"\nOCR text: {ocr_text}"
-    except Exception:
-        pass
-
-    if source_hint:
-        caption += f"\nSource: {source_hint}"
-
-    return caption
-
+ 
+        def extract_words(img):
+            words = []
+            try:
+                ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+                for i in range(len(ocr_data["text"])):
+                    text = ocr_data["text"][i].strip()
+                    conf = int(ocr_data["conf"][i])
+                    if conf > 40 and len(text) >= 1:
+                        clean_text = "".join([c for c in text if c.isalnum() or c in "-()"])
+                        if clean_text:
+                            words.append(clean_text)
+            except Exception:
+                pass
+            for psm in [3, 11, 12]:
+                try:
+                    ocr_str = pytesseract.image_to_string(img, config=f"--psm {psm}").strip()
+                    for line in ocr_str.splitlines():
+                        for w in line.split():
+                            w_clean = "".join([c for c in w if c.isalnum() or c in "-()"])
+                            if len(w_clean) >= 1:
+                                words.append(w_clean)
+                except Exception:
+                    pass
+            return words
+ 
+        words_orig = extract_words(image)
+        gray       = image.convert("L")
+        resized    = gray.resize((gray.width * 2, gray.height * 2), Image.Resampling.LANCZOS)
+        words_prep = extract_words(resized)
+ 
+        all_words  = words_orig + words_prep
+        seen_lower = set()
+        unique_words = []
+        for w in all_words:
+            w_lower = w.lower()
+            if w_lower not in seen_lower:
+                seen_lower.add(w_lower)
+                unique_words.append(w)
+ 
+        valid_words = []
+        for w in unique_words:
+            if len(w) >= 2:
+                if any(c.isalpha() for c in w):
+                    valid_words.append(w)
+            elif len(w) == 1:
+                if w.lower() in {'q', 'k', 'v', 'h', 'w', 'x', 'y', 'z'}:
+                    valid_words.append(w)
+ 
+        ocr_text = " | ".join(valid_words)
+    except Exception as e:
+        print(f"    [OCR WARNING] Local OCR failed (is Tesseract installed?): {e}")
+ 
+    return caption, ocr_text
 
 # ─────────────────────────────────────────────────────────
 #  HELPER — load base64 on-demand from disk
@@ -208,66 +313,78 @@ def extract_tables(pdf_path: str) -> list[Document]:
 # ─────────────────────────────────────────────────────────
 #  STEP 3: EXTRACT & SAVE IMAGES
 # ─────────────────────────────────────────────────────────
-def extract_images(pdf_path: str) -> list[Document]:
+def extract_images(pdf_path):
     """
     Extract embedded images from PDF pages.
-
-    1: page_content is now keyword-dense (filename, page number, figure
-            labels, BLIP caption, OCR text, size) so embedding-based retrieval
-            can actually match visual queries.
-
-    2: base64 is NOT stored in FAISS metadata. Only image_path is stored.
-            Call get_image_base64(doc.metadata["image_path"]) at query time.
+ 
+    1. page_content now leads with figure caption text (from PDF) so the
+       FAISS embedding is anchored to the actual diagram name.
+    2. Groq Vision / BLIP caption comes second.
+    3. OCR is stored in metadata["ocr_text"] separately — NOT merged into
+       page_content — so it doesn't dilute the embedding.
+    4. page_content also includes the figure title extracted from Groq output
+       if present (first line starting with "Figure title:").
     """
-    docs = []
+    docs     = []
     filename = os.path.basename(pdf_path)
     pdf_stem = os.path.splitext(filename)[0]
-
-    seen_xrefs: set[int] = set()
-    seen_hashes: set[str] = set()
-
+ 
+    seen_xrefs:  set = set()
+    seen_hashes: set = set()
+ 
     os.makedirs(IMAGES_DIR, exist_ok=True)
-
+ 
     pdf = fitz.open(pdf_path)
-
+ 
     for page_num, page in enumerate(pdf, start=1):
         image_list = page.get_images(full=True)
-
-        for img_idx, img_info in enumerate(image_list, start=1):
+ 
+        positioned_images = []
+        for img_info in image_list:
+            xref  = img_info[0]
+            rects = page.get_image_rects(xref)
+            x0, y0 = 0, 0
+            if rects:
+                x0 = rects[0].x0
+                y0 = rects[0].y0
+            positioned_images.append({"info": img_info, "x0": x0, "y0": y0})
+ 
+        positioned_images.sort(key=lambda item: (int(item["y0"]) // 50, item["x0"]))
+        sorted_image_list = [item["info"] for item in positioned_images]
+ 
+        for img_idx, img_info in enumerate(sorted_image_list, start=1):
             try:
                 xref = img_info[0]
-
+ 
                 if xref in seen_xrefs:
                     print(f"    [img {img_idx} pg {page_num}] Skipped — duplicate xref {xref}")
                     continue
                 seen_xrefs.add(xref)
-
+ 
                 base_image  = pdf.extract_image(xref)
                 image_bytes = base_image["image"]
                 image_ext   = base_image.get("ext", "png")
-
+ 
                 img_hash = hashlib.md5(image_bytes).hexdigest()
                 if img_hash in seen_hashes:
                     print(f"    [img {img_idx} pg {page_num}] Skipped — duplicate content hash")
                     continue
                 seen_hashes.add(img_hash)
-
-                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+ 
+                image         = Image.open(io.BytesIO(image_bytes)).convert("RGB")
                 width, height = image.size
-
+ 
                 if width < MIN_IMAGE_WIDTH or height < MIN_IMAGE_HEIGHT:
                     continue
-
-                # Save image to disk
+ 
                 img_filename  = f"{pdf_stem}_page{page_num}_img{img_idx}.{image_ext}"
                 img_save_path = os.path.join(IMAGES_DIR, img_filename)
                 image.save(img_save_path)
-
-                # Determine page position
-                position_desc = "center"
+ 
+                position_desc = "center of the page"
                 rects = page.get_image_rects(xref)
                 if rects:
-                    rect = rects[0]
+                    rect       = rects[0]
                     page_width = page.rect.width
                     if rect.x1 <= page_width / 2:
                         position_desc = "left side of the page"
@@ -275,37 +392,76 @@ def extract_images(pdf_path: str) -> list[Document]:
                         position_desc = "right side of the page"
                     else:
                         position_desc = "center of the page"
-
-                # Collect figure/table captions from surrounding text
+ 
+                # ── Spatially-scoped figure caption from PDF text ──
                 page_captions = []
-                blocks = page.get_text("blocks")
-                for b in blocks:
-                    text_block = b[4].strip()
-                    if text_block.startswith(("Figure ", "Fig. ", "Table ")):
-                        clean_block = " ".join(text_block.split())
-                        page_captions.append(clean_block)
+                blocks        = page.get_text("blocks")
+ 
+                if rects:
+                    rect = rects[0]
+                    for b in blocks:
+                        bx0, by0, bx1, by1 = b[0], b[1], b[2], b[3]
+                        text_block = b[4].strip()
+                        if by0 >= rect.y1 and by0 <= rect.y1 + 80:
+                            if text_block.startswith(("Figure ", "Fig. ", "Table ")):
+                                page_captions.append(" ".join(text_block.split()))
+                else:
+                    for b in blocks:
+                        text_block = b[4].strip()
+                        if text_block.startswith(("Figure ", "Fig. ", "Table ")):
+                            page_captions.append(" ".join(text_block.split()))
+ 
                 page_caption_text = " | ".join(page_captions)
+ 
+                # ── Groq Vision / BLIP caption ──
+                source_hint            = f"{filename}, page {page_num}, image {img_idx}"
+                vision_caption, ocr_text = generate_image_caption(image, source_hint=source_hint)
+ 
+                # This gives us the clean diagram name to lead the embedding.
+                figure_title = ""
+                vision_lines = vision_caption.splitlines()
+                remaining_lines = []
+                for line in vision_lines:
+                    if line.lower().startswith("figure title:"):
+                        figure_title = line.split(":", 1)[-1].strip()
+                    else:
+                        remaining_lines.append(line)
+                vision_body = "\n".join(remaining_lines).strip()
 
-                # BLIP caption + OCR
-                source_hint  = f"{filename}, page {page_num}, image {img_idx}"
-                blip_caption = generate_image_caption(image, source_hint=source_hint)
-
-                # ── 1: keyword-dense page_content ──────────────────────
-                # Include all contextual signals so the embedding is rich enough
-                # for cosine similarity to match queries like "architecture diagram"
-                # or "figure 3" or "network topology".
+                # Fallback block when figure_title is empty
+                if not figure_title:
+                    if page_caption_text:
+                        figure_title = page_caption_text
+                    else:
+                        # grab first non-empty line from vision output as title
+                        for line in vision_body.splitlines():
+                            line = line.strip().lstrip("-").strip()
+                            if len(line) > 8 and not line.startswith("Source:"):
+                                figure_title = line[:80]
+                                break
+ 
+                # OCR stored in metadata and also conditionally in page_content for local fallback
+                clean_ocr_words = [
+                    w for w in ocr_text.split(" | ")
+                    if len(w.strip()) >= 3
+                ]
+                clean_ocr = " | ".join(clean_ocr_words)
+ 
+                # ── Build page_content: figure name leads, vision body second ──
+                leading_title = figure_title or page_caption_text or "diagram figure visual"
+ 
                 rich_content = (
-                    f"[IMAGE] {blip_caption}\n"
+                    f"[IMAGE] {leading_title}\n"
+                    + (f"PDF caption: {page_caption_text}\n" if page_caption_text and figure_title else "")
+                    + f"{vision_body}\n"
                     f"File: {filename} | Page: {page_num} | Image index: {img_idx}\n"
                     f"Position: {position_desc} | Size: {width}x{height} pixels\n"
                     f"Type: image diagram figure visual chart graph illustration\n"
-                    + (f"Figure reference: {page_caption_text}\n" if page_caption_text else "")
+                    + (f"OCR_LABELS: {clean_ocr}\n" if clean_ocr else "")
                 )
-
-                print(f"    [img {img_idx}] Indexed: {rich_content[:80].strip()}...")
-
-                # ── 2: no base64 in metadata ───────────────────────────
-                # base64 is loaded on-demand via get_image_base64(image_path).
+ 
+                print(f"    [img {img_idx}] Indexed: {rich_content[:100].strip()}...")
+ 
                 docs.append(Document(
                     page_content=rich_content,
                     metadata={
@@ -313,19 +469,21 @@ def extract_images(pdf_path: str) -> list[Document]:
                         "page":        page_num,
                         "type":        "image",
                         "image_index": img_idx,
-                        "image_path":  img_save_path,   # ← only path stored
+                        "image_path":  img_save_path,
                         "image_size":  f"{width}x{height}",
-                        "caption":     blip_caption,
+                        "caption":     vision_caption,
+                        "ocr_text":    clean_ocr,       
+                        "figure_title": figure_title,
+                        "position":    position_desc,
                     }
                 ))
-
+ 
             except Exception as e:
                 print(f"    Could not process image {img_idx} on page {page_num}: {e}")
-
+ 
     pdf.close()
     print(f"    Images saved to '{IMAGES_DIR}/'")
     return docs
-
 
 # ─────────────────────────────────────────────────────────
 #  STEP 4: LOAD ALL PDFs
@@ -388,7 +546,7 @@ def chunk_documents(docs: list[Document]) -> list[Document]:
     chunks.extend(image_docs)
 
     print(f" Total chunks after splitting: {len(chunks)} "
-          f"({len(other_docs)} text/table → {len(chunks) - len(image_docs)} chunks, "
+          f"({len(other_docs)} text/table -> {len(chunks) - len(image_docs)} chunks, "
           f"{len(image_docs)} image docs)")
     return chunks
 
@@ -407,6 +565,10 @@ def create_faiss_index(chunks: list[Document]) -> FAISS:
 
     print("  Creating FAISS index...")
     vectorstore = FAISS.from_documents(chunks, embeddings)
+
+    import shutil
+    if os.path.exists(FAISS_INDEX_DIR):
+        shutil.rmtree(FAISS_INDEX_DIR)
 
     os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
     vectorstore.save_local(FAISS_INDEX_DIR)
@@ -435,80 +597,150 @@ def load_faiss_index() -> FAISS:
 
 
 # ─────────────────────────────────────────────────────────
-#  STEP 8: ENSEMBLE RETRIEVER  ← 3 applied
-# ─────────────────────────────────────────────────────────
+#  STEP 8: ENSEMBLE RETRIEVER
+# ───────────────────────────────────────────────────────
 class EnsembleRAGRetriever(BaseRetriever):
     """
     Custom retriever with query-intent routing.
-
-    3: FAISS filter={"type": "image"} applies post-retrieval only over the
-    top-k results — if those k docs happen to all be text, the filter returns
-    nothing. Instead we oversample (k=40) and filter by metadata type manually,
-    guaranteeing image/table docs are surfaced when the query asks for them.
+ 
+    KEY FIXES:
+    1. OVERSAMPLE_K raised to 80 (was 40) — image docs often rank 41-60.
+    2. Keyword-based fallback search when dense retrieval returns no images:
+       strips stop-words from query and retries with technical terms only.
+    3. Returns top-2 image hits (was top-1) so LLM has better context.
+    4. Extended image keyword list to catch more diagram-related queries.
+    5. Extended table keyword list similarly.
     """
     vectorstore: FAISS
     k: int = 8
-
-    # How many candidates to fetch before manual type-filtering
-    OVERSAMPLE_K: int = 40
-
+ 
+    OVERSAMPLE_K: int = 80 
+ 
+    # FIX: broader keyword lists
+    IMAGE_KEYWORDS: list = [
+        "diagram", "figure", "image", "architecture", "illustration",
+        "picture", "visual", "chart", "graph", "plot", "screenshot",
+        "photo", "drawing", "sketch", "map", "fig", "shown", "show",
+        "depict", "depicts", "look", "looks", "attention", "encoder",
+        "decoder", "layer", "network", "model", "structure", "multi-head",
+        "scaled", "dot-product", "softmax", "components", "operations",
+        "inside", "output", "input", "what is shown", "what are shown"
+    ]
+ 
+    TABLE_KEYWORDS: list = [
+        "table", "tabular", "column", "row", "cells", "spreadsheet",
+        "csv", "matrix", "grid", "statistics", "numbers", "results",
+        "performance", "bleu", "score", "comparison", "benchmark"
+    ]
+ 
+    # Stop words to strip when building keyword fallback query
+    STOP_WORDS: set = {
+        "what", "which", "where", "when", "how", "are", "is", "the",
+        "a", "an", "in", "of", "to", "for", "and", "or", "shown",
+        "show", "does", "do", "can", "could", "would", "between",
+        "inside", "from", "with", "on", "at", "by"
+    }
+ 
+    def _keyword_fallback_search(self, query: str, doc_type: str) -> list:
+        """
+        Strip stop words from query and retry similarity search.
+        Guarantees we search on the technical terms (e.g. 'Scaled Dot-Product Attention')
+        rather than the full question string which dilutes the embedding.
+        """
+        tokens = [
+            w for w in query.split()
+            if len(w) > 2 and w.lower() not in self.STOP_WORDS
+        ]
+        if not tokens:
+            return []
+ 
+        fallback_query = " ".join(tokens)
+        print(f"    [retriever] keyword fallback query: '{fallback_query}'")
+        candidates = self.vectorstore.similarity_search(fallback_query, k=self.OVERSAMPLE_K)
+        return [d for d in candidates if d.metadata.get("type") == doc_type]
+ 
     def _get_relevant_documents(
         self,
         query: str,
         *,
-        run_manager: CallbackManagerForRetrieverRun = None,
-    ) -> list[Document]:
-
+        run_manager: "CallbackManagerForRetrieverRun" = None,
+    ) -> list:
+ 
         query_lower = query.lower()
-
-        needs_image = any(kw in query_lower for kw in [
-            "diagram", "figure", "image", "architecture", "illustration",
-            "picture", "visual", "chart", "graph", "plot", "screenshot",
-            "photo", "drawing", "sketch", "map", "fig"
-        ])
-        needs_table = any(kw in query_lower for kw in [
-            "table", "tabular", "column", "row", "cells", "spreadsheet",
-            "csv", "matrix", "grid", "statistics", "numbers"
-        ])
-
-        # Standard similarity search (base results)
+ 
+        needs_image = any(kw in query_lower for kw in self.IMAGE_KEYWORDS)
+        needs_table = any(kw in query_lower for kw in self.TABLE_KEYWORDS)
+ 
+        # Base similarity search
         docs = self.vectorstore.similarity_search(query, k=self.k)
-
-        extra_docs: list[Document] = []
-
+ 
+        extra_docs = []
+ 
         if needs_image:
-            # ── 3: oversample broadly, then filter by type in Python ──
-            candidates = self.vectorstore.similarity_search(
+            candidates = self.vectorstore.similarity_search_with_score(
                 query, k=self.OVERSAMPLE_K
             )
+            # similarity_search_with_score returns (doc, score) — lower score = more similar in FAISS
             image_hits = [
-                d for d in candidates
+                d for d, score in candidates
                 if d.metadata.get("type") == "image"
             ]
-            extra_docs.extend(image_hits[:1])   # top-1 image match (most relevant only)
+
+            if not image_hits:
+                # keyword fallback
+                tokens = [
+                    w for w in query.split()
+                    if len(w) > 2 and w.lower() not in self.STOP_WORDS
+                ]
+                if tokens:
+                    fb_candidates = self.vectorstore.similarity_search_with_score(
+                        " ".join(tokens), k=self.OVERSAMPLE_K
+                    )
+                    image_hits = [
+                        d for d, score in fb_candidates
+                        if d.metadata.get("type") == "image"
+                    ]
+
+            extra_docs.extend(image_hits[:4])
 
         if needs_table:
-            candidates = self.vectorstore.similarity_search(
+            candidates = self.vectorstore.similarity_search_with_score(
                 query, k=self.OVERSAMPLE_K
             )
             table_hits = [
-                d for d in candidates
+                d for d, score in candidates
                 if d.metadata.get("type") == "table"
             ]
-            extra_docs.extend(table_hits[:1])   # top-1 table match (most relevant only)
 
-        # Merge: type-specific hits first, then general results, deduplicated
-        seen:   set   = set()
-        merged: list  = []
+            if not table_hits:
+                # keyword fallback
+                tokens = [
+                    w for w in query.split()
+                    if len(w) > 2 and w.lower() not in self.STOP_WORDS
+                ]
+                if tokens:
+                    fb_candidates = self.vectorstore.similarity_search_with_score(
+                        " ".join(tokens), k=self.OVERSAMPLE_K
+                    )
+                    table_hits = [
+                        d for d, score in fb_candidates
+                        if d.metadata.get("type") == "table"
+                    ]
 
+            # FIX: top-1 only — prevents unrelated sibling tables from leaking in
+            extra_docs.extend(table_hits[:1])
+ 
+        # Merge: type-specific hits first, then general, deduplicated
+        seen:   set  = set()
+        merged: list = []
+ 
         for d in extra_docs + docs:
             uid = d.metadata.get("chunk_id") or hash(d.page_content)
             if uid not in seen:
                 seen.add(uid)
                 merged.append(d)
-
-        return merged[: self.k]
-
+ 
+        return merged[: self.k + 6]
 
 # ─────────────────────────────────────────────────────────
 #  QUERY-TIME HELPER — attach base64 to retrieved image docs
@@ -523,7 +755,7 @@ def enrich_with_base64(docs: list[Document]) -> list[Document]:
         retrieved = enrich_with_base64(retrieved)
         for doc in retrieved:
             if doc.metadata.get("type") == "image":
-                b64 = doc.metadata.get("base64_image")   # ← ready for UI
+                b64 = doc.metadata.get("base64_image")
     """
     for doc in docs:
         if doc.metadata.get("type") == "image":

@@ -14,14 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
-from langchain_groq import ChatGroq
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_classic.chains import ConversationalRetrievalChain
-from langchain_classic.memory import ConversationBufferMemory
-from langchain_classic.prompts import PromptTemplate
-
-from ingest import run_ingestion, load_faiss_index, FAISS_INDEX_DIR, EMBED_MODEL, EnsembleRAGRetriever
+from ingest import run_ingestion, FAISS_INDEX_DIR, EMBED_MODEL
+from rag_core import build_chain
 
 load_dotenv()
 
@@ -46,75 +40,20 @@ app.add_middleware(
 # ─────────────────────────────────────────────────────────
 #  GLOBAL STATE
 # ─────────────────────────────────────────────────────────
-rag_chain = None
-chat_history = []
-
-RAG_PROMPT = PromptTemplate(
-    input_variables=["context", "chat_history", "question"],
-    template="""You are a helpful AI assistant that answers questions based on the provided PDF documents.
-
-Use the following context from the documents to answer the question.
-If the answer is not in the context, say "I couldn't find that information in the provided documents."
-Always be concise, accurate, and helpful.
-
-IMPORTANT RULES FOR IMAGES/DIAGRAMS:
-1. In the context, you will find image entries showing: "File: <pdf_name> | Page: <page_num> | Image index: <image_idx>".
-2. If the user asks for a diagram, figure, image, or architecture, or if a diagram is highly relevant to answering their question:
-   - Identify the correct image from the context.
-   - Pay close attention to the spatial position (e.g. left vs right side of the page) and map it to the corresponding figure caption text (e.g. "(left) ... (right) ...") to make sure you select the correct image.
-   - You MUST include the exact tag `[IMAGE REFERENCE: page <page_num>, image <image_index>]` in your answer where appropriate. Do not modify the numbers inside the tag.
-   - Example: "The architecture of Multi-Head Attention is shown in [IMAGE REFERENCE: page 4, image 2]. It consists of..."
-3. If no images are relevant, do not output any `[IMAGE REFERENCE: ...]` tags.
-
-Context from documents:
-{context}
-
-Chat History:
-{chat_history}
-
-Question: {question}
-
-Answer:"""
-)
-
-
-# ─────────────────────────────────────────────────────────
-#  HELPER: Load RAG Chain
-# ─────────────────────────────────────────────────────────
-def get_rag_chain(model_name: str = None):
-    """Build and return the RAG chain."""
+def get_rag_chain(model_name: str = None, session_id: str = "default_session"):
+    """Build and return the RAG chain using the shared builder."""
     if not model_name:
         model_name = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-
-    vectorstore = load_faiss_index()
-    retriever = EnsembleRAGRetriever(vectorstore=vectorstore, k=8)
-    llm = ChatGroq(
-        model=model_name,
-        temperature=0.2,
-        groq_api_key=os.getenv("GROQ_API_KEY")
-    )
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer"
-    )
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        combine_docs_chain_kwargs={"prompt": RAG_PROMPT},
-        return_source_documents=True,
-        verbose=False
-    )
+    chain, _ = build_chain(model_name, session_id=session_id)
     return chain
-
 
 # ─────────────────────────────────────────────────────────
 #  PYDANTIC MODELS
 # ─────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     question: str
-    model: Optional[str] = None   # overrides GROQ_MODEL from .env if provided
+    model: Optional[str] = None
+    session_id: Optional[str] = "default_session"
 
 class ChatResponse(BaseModel):
     answer: str
@@ -159,29 +98,27 @@ def chat(request: ChatRequest):
     Ask a question. Returns an answer from the RAG pipeline
     along with source document references.
     """
-    global rag_chain
-
     # Check index exists
     if not os.path.exists(os.path.join(FAISS_INDEX_DIR, "index.faiss")):
         raise HTTPException(
             status_code=400,
             detail="FAISS index not found. Please run /ingest first."
         )
-
+ 
     # Check API key
     if not os.getenv("GROQ_API_KEY"):
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not set in .env")
-
-    # Load chain (lazy init)
-    if rag_chain is None:
-        try:
-            rag_chain = get_rag_chain(request.model)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load RAG chain: {e}")
-
+ 
+    # Load chain dynamically per session
+    try:
+        session_id = request.session_id or "default_session"
+        chain = get_rag_chain(request.model, session_id=session_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load RAG chain: {e}")
+ 
     # Run query
     try:
-        result = rag_chain.invoke({"question": request.question})
+        result = chain.invoke({"question": request.question})
         answer = result.get("answer", "No answer generated.")
         source_docs = result.get("source_documents", [])
 
@@ -260,7 +197,7 @@ def ingest():
     global rag_chain
     try:
         vectorstore = run_ingestion()
-        rag_chain = None   # Reset chain so it reloads with new index
+        rag_chain = None
         if vectorstore is None:
             return IngestResponse(
                 status="warning",

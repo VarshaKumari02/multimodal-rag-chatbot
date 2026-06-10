@@ -11,16 +11,12 @@
 import os
 import streamlit as st
 import re
+import base64
+import html
 from dotenv import load_dotenv
 
-from langchain_groq import ChatGroq
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_classic.chains import ConversationalRetrievalChain
-from langchain_classic.memory import ConversationBufferMemory
-from langchain_classic.prompts import PromptTemplate
-
-from ingest import run_ingestion, load_faiss_index, FAISS_INDEX_DIR, EMBED_MODEL, EnsembleRAGRetriever
+from ingest import run_ingestion, FAISS_INDEX_DIR, EMBED_MODEL
+from rag_core import build_chain, SQLiteChatMessageHistory
 
 load_dotenv()
 
@@ -176,66 +172,10 @@ GROQ_MODELS = {
     "Gemma2 9B":                 "gemma2-9b-it",
 }
 
-RAG_PROMPT = PromptTemplate(
-    input_variables=["context", "chat_history", "question"],
-    template="""You are a helpful AI assistant that answers questions based on the provided PDF documents.
-
-Use the following context from the documents to answer the question.
-If the answer is not in the context, say "I couldn't find that information in the provided documents."
-Always be concise, accurate, and helpful.
-
-IMPORTANT RULES FOR IMAGES/DIAGRAMS:
-1. In the context, you will find image entries showing: "File: <pdf_name> | Page: <page_num> | Image index: <image_idx>".
-2. If the user asks for a diagram, figure, image, or architecture, or if a diagram is highly relevant to answering their question:
-   - Identify the correct image from the context.
-   - Pay close attention to the spatial position (e.g. left vs right side of the page) and map it to the corresponding figure caption text (e.g. "(left) ... (right) ...") to make sure you select the correct image.
-   - You MUST include the exact tag `[IMAGE REFERENCE: page <page_num>, image <image_index>]` in your answer where appropriate. Do not modify the numbers inside the tag.
-   - Example: "The architecture of Multi-Head Attention is shown in [IMAGE REFERENCE: page 4, image 2]. It consists of..."
-3. If no images are relevant, do not output any `[IMAGE REFERENCE: ...]` tags.
-
-Context from documents:
-{context}
-
-Chat History:
-{chat_history}
-
-Question: {question}
-
-Answer:"""
-)
-
-
-# ─────────────────────────────────────────────────────────
-#  LOAD FAISS + BUILD RAG CHAIN
-# ─────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_rag_chain(model_name: str):
-    """Load FAISS index and build the conversational RAG chain."""
-    vectorstore = load_faiss_index()
-    retriever = EnsembleRAGRetriever(vectorstore=vectorstore, k=8)
-
-    llm = ChatGroq(
-        model=model_name,
-        temperature=0.2,
-        groq_api_key=os.getenv("GROQ_API_KEY")
-    )
-
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer"
-    )
-
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        combine_docs_chain_kwargs={"prompt": RAG_PROMPT},
-        return_source_documents=True,
-        verbose=False
-    )
-    return chain, vectorstore   # ← also return vectorstore for image search
-
+    """Load FAISS index and build the conversational RAG chain using the shared builder."""
+    return build_chain(model_name, session_id="streamlit_session")
 
 # ─────────────────────────────────────────────────────────
 #  SIDEBAR
@@ -307,6 +247,7 @@ def render_sidebar():
         # Clear chat
         if st.button("🗑️ Clear Chat History", use_container_width=True):
             st.session_state.messages = []
+            SQLiteChatMessageHistory("streamlit_session").clear()
             st.cache_resource.clear()
             st.rerun()
 
@@ -339,6 +280,14 @@ def main():
     # Init chat history
     if "messages" not in st.session_state:
         st.session_state.messages = []
+        db_history = SQLiteChatMessageHistory("streamlit_session")
+        for msg in db_history.messages:
+            role = "user" if msg.type == "human" else "assistant"
+            st.session_state.messages.append({
+                "role": role,
+                "content": msg.content,
+                "sources": []
+            })
 
     # Check FAISS index
     index_exists = os.path.exists(os.path.join(FAISS_INDEX_DIR, "index.faiss"))
@@ -371,14 +320,20 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
+        # Get last user query safely before the render loop
         last_user_query = ""
-        for msg in st.session_state.messages:
+        for msg in reversed(st.session_state.messages):
             if msg["role"] == "user":
                 last_user_query = msg["content"].lower()
+                break
+
+        for msg in st.session_state.messages:
+            if msg["role"] == "user":
+                escaped_user_content = html.escape(msg["content"])
                 st.markdown(f"""
                 <div class="user-message">
                     <div class="message-label">You</div>
-                    {msg['content']}
+                    {escaped_user_content}
                 </div>""", unsafe_allow_html=True)
             else:
                 clean_content = re.sub(
@@ -414,11 +369,12 @@ def main():
                         ]
                     else:
                         # Fallback: if user asked for a diagram/architecture but LLM didn't generate tag, show top-1
-                        needs_image = any(kw in last_user_query for kw in [
+                        image_keywords = [
                             "diagram", "figure", "image", "architecture", "illustration",
                             "picture", "visual", "chart", "graph", "plot", "screenshot",
                             "photo", "drawing", "sketch", "map", "fig"
-                        ])
+                        ]
+                        needs_image = any(kw in last_user_query for kw in image_keywords)
                         
                         all_image_sources = [
                             doc for doc in msg["sources"]
@@ -426,7 +382,7 @@ def main():
                             and (doc.metadata.get("base64_image") or os.path.exists(doc.metadata.get("image_path", "")))
                         ]
                         if needs_image and all_image_sources:
-                            image_sources = all_image_sources[:1]
+                            image_sources = all_image_sources[:3]
                         else:
                             image_sources = []
                     for doc in image_sources:
