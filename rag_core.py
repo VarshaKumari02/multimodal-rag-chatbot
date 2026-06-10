@@ -40,59 +40,6 @@ def get_shared_vectorstore() -> FAISS:
 # ─────────────────────────────────────────────────────────
 #  RAG PROMPT TEMPLATE (Soften Rule - Issue 5)
 # ─────────────────────────────────────────────────────────
-# RAG_PROMPT = PromptTemplate(
-#     input_variables=["context", "chat_history", "question"],
-#     template="""You are a helpful AI assistant that answers questions based on the provided PDF documents.
-
-# Use the following context from the documents to answer the question.
-# If the answer is not in the context, say "I couldn't find that information in the provided documents."
-# Always be accurate, informative, and helpful.
-
-# STRICT FOCUS RULE:
-# Answer ONLY what the user asked.
-# Avoid mentioning Multi-Head Attention unless explicitly asked.
-# Stay strictly on topic. Do not volunteer related figures or mechanisms unless explicitly asked.
-
-# STRICT RULE — NO HALLUCINATION:
-# The description and OCR text labels in image entries below describe ONLY what is physically visible in that specific figure. Do NOT add components, layers, or steps that are not explicitly listed. If a component is not mentioned, do not include it.
-
-# RULES FOR REFERENCING IMAGES/DIAGRAMS:
-# The context below may contain image entries. Each image entry looks like:
-
-#   [IMAGE] <figure title or name>
-#   PDF caption: <caption from the PDF if available>
-#   <vision model description and/or OCR text labels>
-#   File: <pdf_name> | Page: <page_num> | Image index: <image_idx>
-#   Position: <left / right / center of the page>
-
-# WHEN TO EMIT AN IMAGE REFERENCE TAG:
-# - If the user asks about a diagram, figure, visual, or architectural component
-# - OR if an image entry in the context is clearly relevant to answering the question
-
-# HOW TO EMIT IT:
-# - Include the EXACT tag `[IMAGE REFERENCE: page <page_num>, image <image_index>]`
-#   using the numbers from the "Page:" and "Image index:" fields of that image entry.
-# - Do NOT modify the numbers. Do NOT skip the tag if an image is relevant.
-# - Only emit the tag for the image directly relevant to the question.
-#   If the user asks about Scaled Dot-Product Attention, only emit that figure's tag.
-#   Do NOT emit the Multi-Head Attention tag unless asked.
-
-# After the tag, explain the diagram in detail using ONLY what the description and OCR text labels state.
-# Do not say "likely" or "it is difficult to say" — base the answer strictly on the provided image details.
-
-# If no image in the context is relevant, do not output any [IMAGE REFERENCE: ...] tags.
-
-# Context from documents:
-# {context}
-
-# Chat History:
-# {chat_history}
-
-# Question: {question}
-
-# Answer:"""
-# )
-
 RAG_PROMPT = PromptTemplate(
     input_variables=["context", "chat_history", "question"],
     template="""You are a helpful AI assistant that answers questions based on the provided PDF documents.

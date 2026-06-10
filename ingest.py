@@ -136,7 +136,7 @@ def generate_image_caption(image, source_hint=""):
                     }
                 ],
                 model="llama-3.2-11b-vision-preview",
-                max_tokens=400   # increased from 300 for richer captions
+                max_tokens=400
             )
             caption = response.choices[0].message.content.strip()
             if source_hint:
@@ -612,7 +612,7 @@ class EnsembleRAGRetriever(BaseRetriever):
     5. Extended table keyword list similarly.
     """
     vectorstore: FAISS
-    k: int = 8
+    k: int = 4
  
     OVERSAMPLE_K: int = 80 
  
@@ -621,10 +621,8 @@ class EnsembleRAGRetriever(BaseRetriever):
         "diagram", "figure", "image", "architecture", "illustration",
         "picture", "visual", "chart", "graph", "plot", "screenshot",
         "photo", "drawing", "sketch", "map", "fig", "shown", "show",
-        "depict", "depicts", "look", "looks", "attention", "encoder",
-        "decoder", "layer", "network", "model", "structure", "multi-head",
-        "scaled", "dot-product", "softmax", "components", "operations",
-        "inside", "output", "input", "what is shown", "what are shown"
+        "depict", "depicts", "look", "looks",
+        "layer", "network", "model", "structure",
     ]
  
     TABLE_KEYWORDS: list = [

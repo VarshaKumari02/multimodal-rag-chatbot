@@ -372,7 +372,9 @@ def main():
                         image_keywords = [
                             "diagram", "figure", "image", "architecture", "illustration",
                             "picture", "visual", "chart", "graph", "plot", "screenshot",
-                            "photo", "drawing", "sketch", "map", "fig"
+                            "photo", "drawing", "sketch", "map", "fig", "shown", "show",
+                            "depict", "depicts", "look", "looks",
+                            "layer", "network", "model", "structure"
                         ]
                         needs_image = any(kw in last_user_query for kw in image_keywords)
                         
