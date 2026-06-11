@@ -61,20 +61,31 @@ The context below may contain image entries. Each image entry looks like:
   File: <pdf_name> | Page: <page_num> | Image index: <image_idx>
   Position: <left / right / center of the page>
 
+CRITICAL IMAGE MATCHING RULE:
+- Read the [IMAGE] title and PDF caption of EVERY image entry in the context.
+- Only reference an image if its [IMAGE] title or PDF caption DIRECTLY matches what
+  the user is asking about.
+- NEVER reference an image just because it appears in the context — match by name.
+- For example:
+    * If the user asks about "Multi-Head Attention diagram", ONLY reference images
+      whose [IMAGE] title or PDF caption contains "Multi-Head Attention".
+    * If the user asks about "Scaled Dot-Product Attention", ONLY reference images
+      whose [IMAGE] title or PDF caption contains "Scaled Dot-Product".
+    * If the user asks about the "Transformer architecture", ONLY reference images
+      whose [IMAGE] title contains "Transformer" or "model architecture".
+- Do NOT confuse diagrams. "Multi-Head Attention" and "Scaled Dot-Product Attention"
+  are TWO DIFFERENT diagrams that appear on the same page. Use Page + Position fields
+  to distinguish them.
+
 WHEN TO EMIT AN IMAGE REFERENCE TAG:
 - If the user asks about a diagram, figure, visual, or architectural component
-- OR if an image entry in the context is clearly relevant to answering the question
-- If the question asks about multiple attention types (e.g. "types of attention", 
-  "different attention mechanisms", "explain attention"), emit a tag for EVERY 
-  relevant image found in the context — one tag per figure.
+- AND an image entry in the context has a matching title/caption
 
 HOW TO EMIT IT:
 - Include the EXACT tag `[IMAGE REFERENCE: page <page_num>, image <image_index>]`
-  using the numbers from the "Page:" and "Image index:" fields of that image entry.
-- Do NOT modify the numbers. Do NOT skip the tag if an image is relevant.
-- Emit one tag per relevant image. If two figures are both relevant to the question,
-  emit both tags — one for each.
-- Place each tag immediately before the explanation of that specific figure.
+  using the numbers from the "Page:" and "Image index:" fields of ONLY the matching image.
+- Do NOT emit tags for images that don't match the question topic.
+- Place the tag immediately before your explanation of that specific figure.
 
 FORMAT WHEN MULTIPLE IMAGES ARE RELEVANT:
 [IMAGE REFERENCE: page <N>, image <M>]
@@ -86,7 +97,7 @@ FORMAT WHEN MULTIPLE IMAGES ARE RELEVANT:
 After each tag, explain that diagram using ONLY what the description and OCR text labels state.
 Do not say "likely" or "it is difficult to say" — base the answer strictly on the provided image details.
 
-If no image in the context is relevant, do not output any [IMAGE REFERENCE: ...] tags.
+If no image in the context matches the question, do not output any [IMAGE REFERENCE: ...] tags.
 
 Context from documents:
 {context}
@@ -180,10 +191,21 @@ class EnsembleRAGRetriever(BaseRetriever):
     k: int = 10
     OVERSAMPLE_K: int = 80
 
-    def _search(self, query: str, doc_type: str, limit: int) -> List[Document]:
-        """Perform semantic similarity search and filter by metadata type."""
-        candidates = self.vectorstore.similarity_search(query, k=self.OVERSAMPLE_K)
-        return [d for d in candidates if d.metadata.get("type") == doc_type][:limit]
+    def _search_with_score(self, query: str, doc_type: str, limit: int) -> List[Document]:
+        """
+        Perform semantic similarity search, filter by type, and return the
+        top `limit` results ranked by similarity score (most similar first).
+        Using similarity_search_with_score so we can rank properly.
+        """
+        candidates = self.vectorstore.similarity_search_with_score(query, k=self.OVERSAMPLE_K)
+        # FAISS returns (doc, score) where LOWER score = more similar (L2 distance)
+        type_hits = [
+            (doc, score) for doc, score in candidates
+            if doc.metadata.get("type") == doc_type
+        ]
+        # Sort ascending by score so most similar image comes first
+        type_hits.sort(key=lambda x: x[1])
+        return [doc for doc, _ in type_hits[:limit]]
 
     def _get_relevant_documents(
         self,
@@ -191,12 +213,12 @@ class EnsembleRAGRetriever(BaseRetriever):
         *,
         run_manager: Optional[CallbackManagerForRetrieverRun] = None,
     ) -> List[Document]:
-        # Retrieve texts, images, and tables semantically
-        text_docs = self._search(query, "text", limit=self.k)
-        image_docs = self._search(query, "image", limit=2)
-        table_docs = self._search(query, "table", limit=1)
+        # Retrieve texts, images, and tables semantically — images ranked by similarity
+        text_docs  = self._search_with_score(query, "text",  limit=self.k)
+        image_docs = self._search_with_score(query, "image", limit=2)
+        table_docs = self._search_with_score(query, "table", limit=1)
 
-        # Merge, prioritizing image/table hits
+        # Merge: images and tables first (more specific), then text, deduplicated
         seen = set()
         merged = []
         for d in image_docs + table_docs + text_docs:

@@ -79,7 +79,7 @@ def initialize_models():
 # ─────────────────────────────────────────────────────────
 def generate_image_caption(image, source_hint=""):
     """
-    Generate image description using Groq Vision (Llama-3.2-11b-vision).
+    Generate image description using Groq Vision (Llama-4-Scout).
     Falls back to local BLIP + OCR if Groq key is not found or fails.
  
     KEY FIX: Groq Vision prompt now explicitly asks for the figure title/name
@@ -135,7 +135,7 @@ def generate_image_caption(image, source_hint=""):
                         ]
                     }
                 ],
-                model="llama-3.2-11b-vision-preview",
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
                 max_tokens=400
             )
             caption = response.choices[0].message.content.strip()
@@ -310,6 +310,52 @@ def extract_tables(pdf_path: str) -> list[Document]:
     return docs
 
 
+# ─────────────────────────────────────────
+def clean_shared_caption(caption_text: str, position: str) -> str:
+    """
+    Extract the relevant part of a shared figure caption for an image at a
+    given position on the page.
+
+    Handles two common formats:
+      (A) "Figure N: (left) Left Title. (right) Right Title."
+      (B) "Figure N: (left) Left Title (right) Right Title"
+
+    Falls back to returning the full caption if the pattern is not matched.
+    """
+    import re
+    cap_lower = caption_text.lower()
+
+    # Pattern: optional figure prefix then (left) ... (right) ...
+    # E.g. "Figure 2: (left) Scaled Dot-Product Attention. (right) Multi-Head Attention"
+    pattern = re.compile(
+        r'\(left\)\s*(?P<left>.+?)\s*\.?\s*\(right\)\s*(?P<right>.+)',
+        re.IGNORECASE | re.DOTALL
+    )
+    m = pattern.search(caption_text)
+    if m:
+        if position == "left side of the page":
+            return m.group('left').strip().rstrip('.;, ')
+        elif position == "right side of the page":
+            return m.group('right').strip().rstrip('.;, ')
+        # center: return the full caption
+        return caption_text
+
+    # Legacy fallback: old (left)...(right) positional split
+    if "(left)" in cap_lower and "(right)" in cap_lower:
+        left_idx = cap_lower.find("(left)")
+        right_idx = cap_lower.find("(right)")
+        if position == "left side of the page":
+            val = caption_text[left_idx + 6 : right_idx].strip()
+            val = re.sub(r"^[^a-zA-Z0-9]+", "", val)
+            return val.rstrip(".;, ")
+        elif position == "right side of the page":
+            val = caption_text[right_idx + 7 :].strip()
+            val = re.sub(r"^[^a-zA-Z0-9]+", "", val)
+            return val.rstrip(".;, ")
+
+    return caption_text
+
+
 # ─────────────────────────────────────────────────────────
 #  STEP 3: EXTRACT & SAVE IMAGES
 # ─────────────────────────────────────────────────────────
@@ -428,19 +474,33 @@ def extract_images(pdf_path):
                         remaining_lines.append(line)
                 vision_body = "\n".join(remaining_lines).strip()
 
-                # Fallback block when figure_title is empty
-                if not figure_title:
-                    if page_caption_text:
-                        figure_title = page_caption_text
-                    else:
-                        # grab first non-empty line from vision output as title
-                        for line in vision_body.splitlines():
-                            line = line.strip().lstrip("-").strip()
-                            if len(line) > 8 and not line.startswith("Source:"):
-                                figure_title = line[:80]
-                                break
- 
-                # OCR stored in metadata and also conditionally in page_content for local fallback
+                # Treat generic/unhelpful vision titles as empty
+                _GENERIC_TITLES = {"unknown", "n/a", "none", "untitled", "no title", "not specified", ""}
+                if figure_title.lower() in _GENERIC_TITLES:
+                    figure_title = ""
+
+                # Derive position-specific PDF caption (authoritative ground truth).
+                # Two images on same page sharing "(left) X. (right) Y" caption now get
+                # distinct, non-overlapping titles from the PDF itself.
+                specific_pdf_caption = (
+                    clean_shared_caption(page_caption_text, position_desc)
+                    if page_caption_text else ""
+                )
+
+                # PDF caption always overrides vision title — vision model can confuse
+                # a sub-component label (e.g. "Scaled Dot-Product" box inside Multi-Head
+                # Attention) for the overall figure title.
+                if specific_pdf_caption:
+                    figure_title = specific_pdf_caption
+                elif not figure_title:
+                    # Last resort: grab first meaningful line from vision output
+                    for line in vision_body.splitlines():
+                        line = line.strip().lstrip("-").strip()
+                        if len(line) > 8 and not line.startswith("Source:"):
+                            figure_title = line[:80]
+                            break
+
+                # OCR stored in metadata
                 clean_ocr_words = [
                     w for w in ocr_text.split(" | ")
                     if len(w.strip()) >= 3
@@ -448,11 +508,12 @@ def extract_images(pdf_path):
                 clean_ocr = " | ".join(clean_ocr_words)
  
                 # ── Build page_content: figure name leads, vision body second ──
-                leading_title = figure_title or page_caption_text or "diagram figure visual"
+                leading_title = figure_title or "diagram figure visual"
+
  
                 rich_content = (
                     f"[IMAGE] {leading_title}\n"
-                    + (f"PDF caption: {page_caption_text}\n" if page_caption_text and figure_title else "")
+                    + (f"PDF caption: {specific_pdf_caption}\n" if specific_pdf_caption else "")
                     + f"{vision_body}\n"
                     f"File: {filename} | Page: {page_num} | Image index: {img_idx}\n"
                     f"Position: {position_desc} | Size: {width}x{height} pixels\n"

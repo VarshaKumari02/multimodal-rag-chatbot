@@ -118,7 +118,26 @@ def chat(request: ChatRequest):
  
     # Run query
     try:
-        result = chain.invoke({"question": request.question})
+        try:
+            result = chain.invoke({"question": request.question})
+        except Exception as llm_err:
+            err_str = str(llm_err).lower()
+            # Groq sometimes returns empty output — retry once with a simpler prompt
+            if "model output" in err_str or "output text" in err_str or "tool calls" in err_str:
+                try:
+                    simple_question = f"Briefly answer: {request.question}"
+                    result = chain.invoke({"question": simple_question})
+                except Exception:
+                    return ChatResponse(
+                        answer=(
+                            "I'm sorry, I couldn't generate a response for that query. "
+                            "Please try rephrasing your question."
+                        ),
+                        sources=[]
+                    )
+            else:
+                raise
+
         answer = result.get("answer", "No answer generated.")
         source_docs = result.get("source_documents", [])
 
@@ -159,8 +178,8 @@ def chat(request: ChatRequest):
                 "base64_image": doc.metadata.get("base64_image")
             })
 
-        # Fallback: If no explicit image referenced, but query asked for diagram,
-        # find the first image from source_docs and append it
+        # Fallback: If no explicit image referenced but query asks for a diagram,
+        # find the best matching image from source_docs by title keyword matching.
         has_image = any(s["type"] == "image" for s in sources)
         if not has_image:
             query_lower = request.question.lower()
@@ -170,16 +189,29 @@ def chat(request: ChatRequest):
                 "photo", "drawing", "sketch", "map", "fig"
             ])
             if needs_image:
-                for doc in source_docs:
-                    if doc.metadata.get("type") == "image":
-                        sources.append({
-                            "source": doc.metadata.get("source", "Unknown"),
-                            "page": doc.metadata.get("page", "?"),
-                            "type": "image",
-                            "snippet": doc.page_content[:300],
-                            "base64_image": doc.metadata.get("base64_image")
-                        })
-                        break
+                all_image_docs = [d for d in source_docs if d.metadata.get("type") == "image"]
+                query_norm = re.sub(r"[^a-zA-Z0-9\s]", " ", query_lower)
+
+                # Score each image by how many query words appear in its title
+                def title_score(doc):
+                    title = (doc.metadata.get("figure_title") or "").lower()
+                    if not title:
+                        first = doc.page_content.splitlines()[0] if doc.page_content else ""
+                        title = first.replace("[IMAGE]", "").strip().lower()
+                    title_norm = re.sub(r"[^a-zA-Z0-9\s]", " ", title)
+                    return sum(1 for w in query_norm.split() if len(w) > 3 and w in title_norm)
+
+                scored = sorted(all_image_docs, key=title_score, reverse=True)
+                docs_to_add = [d for d in scored if title_score(d) > 0] or all_image_docs[:1]
+
+                for doc in docs_to_add[:2]:
+                    sources.append({
+                        "source": doc.metadata.get("source", "Unknown"),
+                        "page": doc.metadata.get("page", "?"),
+                        "type": "image",
+                        "snippet": doc.page_content[:300],
+                        "base64_image": doc.metadata.get("base64_image")
+                    })
 
         return ChatResponse(answer=clean_answer, sources=sources)
 
