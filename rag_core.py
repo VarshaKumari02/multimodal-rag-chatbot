@@ -19,7 +19,7 @@ from langchain_groq import ChatGroq
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_classic.chains import ConversationalRetrievalChain
-from langchain_classic.memory import ConversationBufferMemory
+from langchain_classic.memory import ConversationTokenBufferMemory
 from langchain_classic.prompts import PromptTemplate
 
 # Configuration (mirrors ingest.py)
@@ -244,11 +244,21 @@ def build_chain(model_name: str, session_id: str):
     )
 
     history = SQLiteChatMessageHistory(session_id=session_id)
-    memory = ConversationBufferMemory(
+    
+    # Retrieve max token limit from environment (default to 1000 tokens)
+    limit_str = os.getenv("HISTORY_TOKEN_LIMIT", "1000")
+    try:
+        max_token_limit = int(limit_str)
+    except ValueError:
+        max_token_limit = 1000
+
+    memory = ConversationTokenBufferMemory(
+        llm=llm,
         chat_memory=history,
         memory_key="chat_history",
         return_messages=True,
-        output_key="answer"
+        output_key="answer",
+        max_token_limit=max_token_limit
     )
 
     chain = ConversationalRetrievalChain.from_llm(
